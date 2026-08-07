@@ -334,10 +334,8 @@ def detect_animals_sam3(chunk, f) -> np.ndarray:
                         video_frames_for_vis,
                         outputs=frame_outputs,
                     )
-                    cv2.imwrite(
-                        os.path.join(config.signs_detection_dir, f"{prompt}_{global_frame_idx}.jpg"),
-                        cv2.cvtColor(detected_img, cv2.COLOR_RGB2BGR),
-                    )
+                    
+                    
 
                 if global_frame_idx > len(cameras) - 1:
                     continue
