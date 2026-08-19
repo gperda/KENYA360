@@ -12,14 +12,20 @@ class Config:
             raise ValueError("Missing required config parameter: [General] input_dir")
         if not os.path.exists(self.input_dir):
             raise ValueError(f"Input directory does not exist: {self.input_dir}")
-
-        self.frames_dir = os.path.join(self.input_dir, "frames")
+        camera = opts.get("General", "camera", fallback=None)
+        if camera is None:
+            raise ValueError("Missing required config parameter: [General] camera")
+        self.frames_dir = os.path.join(self.input_dir, camera)
         if not os.path.exists(self.frames_dir):
             raise ValueError(f"Images directory does not exist: {self.frames_dir}")
         self.output_dir = opts.get("General", "output_dir", fallback=None).strip()
         if self.output_dir is None:
             raise ValueError("Missing required config parameter: [General] output_dir")
-                
+        prompts = opts.get("Detection", "prompts", fallback=None)
+        if prompts is None:
+            raise ValueError("Missing required config parameter: [Detection] prompts")
+
+        self.prompts = [prompt.strip() for prompt in prompts.split(",") if prompt.strip()]
         self.signs_detection_dir = os.path.join(self.output_dir, "detection/animals")
         self.signs_positions_file = os.path.join(self.signs_detection_dir, "animals_positions.csv")
         self.metashape_dir = os.path.join(self.input_dir, "metashape")

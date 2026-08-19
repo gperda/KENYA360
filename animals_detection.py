@@ -14,9 +14,9 @@ import numpy as np
 import warnings
 import shutil
 import Metashape
-from sahi import AutoDetectionModel
-from sahi.predict import get_sliced_prediction
-from sahi.utils.cv import read_image_as_pil
+# from sahi import AutoDetectionModel
+# from sahi.predict import get_sliced_prediction
+# from sahi.utils.cv import read_image_as_pil
 HEIGHT = 640
 WIDTH = 640
 
@@ -24,7 +24,6 @@ model = None
 config = None
 
 def visualize_frame_output(frame_idx, video_frames, outputs):
-    print(video_frames, video_frames[frame_idx])
     img = load_frame(video_frames[frame_idx])
     img = img.copy()  # avoid modifying original
 
@@ -107,27 +106,27 @@ def rel_to_abs_coords(coords, IMG_WIDTH, IMG_HEIGHT, coord_type="box"):
     else:
         raise ValueError(f"Unknown coord_type: {coord_type}")
 
-def detect_animals_sahi():
-    detection_model = AutoDetectionModel.from_pretrained(
-        model_type='ultralytics',
-        model_path=config.model_path,
-        confidence_threshold=0.4,
-        device="cuda:0"
-    )
+# def detect_animals_sahi():
+#     detection_model = AutoDetectionModel.from_pretrained(
+#         model_type='ultralytics',
+#         model_path=config.model_path,
+#         confidence_threshold=0.4,
+#         device="cuda:0"
+#     )
 
     
 
-    for image_path in glob.glob(os.path.join(config.frames_dir, "*.jpg")):
-        image = read_image_as_pil(image_path)
-        prediction = get_sliced_prediction(
-            image=image,
-            detection_model=detection_model,
-            slice_height=256,
-            slice_width=256,
-            overlap_height_ratio=0.2,
-            overlap_width_ratio=0.2,
-        )
-        prediction.export_visuals(config.signs_detection_dir, os.path.basename(image_path))
+#     for image_path in glob.glob(os.path.join(config.frames_dir, "*.jpg")):
+#         image = read_image_as_pil(image_path)
+#         prediction = get_sliced_prediction(
+#             image=image,
+#             detection_model=detection_model,
+#             slice_height=256,
+#             slice_width=256,
+#             overlap_height_ratio=0.2,
+#             overlap_width_ratio=0.2,
+#         )
+#         prediction.export_visuals(config.signs_detection_dir, os.path.basename(image_path))
 
 # def detect_animals_sam3(chunk, f) -> np.ndarray:
 #     """
@@ -238,7 +237,7 @@ def detect_animals_sahi():
 #                 line = f"{camera.label},{x_center:.2f},{y_center:.2f},{X:.6f},{Y:.6f},{Z:.6f},{distance},{class_name},{obj_id},{prob:.4f}\n"
 #                 f.write(line)
 
-def detect_animals_sam3(chunk, f) -> np.ndarray:
+def detect_animals_sam3(chunk, f, prompts) -> np.ndarray:
     # Load video frames for visualization
     video_path = config.frames_dir
     if isinstance(video_path, str) and video_path.endswith(".mp4"):
@@ -267,11 +266,18 @@ def detect_animals_sam3(chunk, f) -> np.ndarray:
     T = chunk.transform.matrix
     cameras = chunk.cameras
 
-    prompts = ["zebra", "elephant", "rhino", "warthog"]
+    frame_output_names = {}
+    combined_output_frames = {}
+
+    for frame_idx, frame_ref in enumerate(video_frames_for_vis):
+        if isinstance(frame_ref, str):
+            frame_output_names[frame_idx] = os.path.basename(frame_ref)
+        else:
+            frame_output_names[frame_idx] = f"{frame_idx}.jpg"
 
     # Split frames into blocks — done once, outside all loops
     BLOCK_SIZE = 100
-    start_offset = 460
+    start_offset = 0
     total_frames = len(video_frames_for_vis)
     frame_blocks = [
         video_frames_for_vis[i:i + BLOCK_SIZE]
@@ -324,7 +330,7 @@ def detect_animals_sam3(chunk, f) -> np.ndarray:
             # Propagate through the block
             outputs_per_frame = propagate_in_video(video_predictor, session_id)
 
-            for local_frame_idx in range(0, len(frame_block)-1):
+            for local_frame_idx in range(0, len(frame_block)):
                 frame_outputs = outputs_per_frame[local_frame_idx]
                 global_frame_idx = block_start + local_frame_idx
 
@@ -334,6 +340,15 @@ def detect_animals_sam3(chunk, f) -> np.ndarray:
                         video_frames_for_vis,
                         outputs=frame_outputs,
                     )
+                    if global_frame_idx not in combined_output_frames:
+                        if isinstance(video_frames_for_vis[global_frame_idx], str):
+                            combined_output_frames[global_frame_idx] = load_frame(video_frames_for_vis[global_frame_idx]).copy()
+                        else:
+                            combined_output_frames[global_frame_idx] = video_frames_for_vis[global_frame_idx].copy()
+
+                    base_frame = load_frame(video_frames_for_vis[global_frame_idx]) if isinstance(video_frames_for_vis[global_frame_idx], str) else video_frames_for_vis[global_frame_idx]
+                    changed_pixels = np.any(detected_img != base_frame, axis=2)
+                    combined_output_frames[global_frame_idx][changed_pixels] = detected_img[changed_pixels]
                     
                     
 
@@ -373,6 +388,13 @@ def detect_animals_sam3(chunk, f) -> np.ndarray:
                     session_id=session_id,
                 )
             )
+
+    for frame_idx, combined_img in combined_output_frames.items():
+        output_name = frame_output_names[frame_idx]
+        cv2.imwrite(
+            os.path.join(config.signs_detection_dir, output_name),
+            cv2.cvtColor(combined_img, cv2.COLOR_RGB2BGR),
+        )
 
 def detect_animals_yolo(img, chunk, camera, f) -> np.ndarray:
     """
@@ -460,9 +482,9 @@ def detect() -> None:
                 detected_img= detect_animals_yolo(img, chunk, camera, f)
                 cv2.imwrite(os.path.join(config.signs_detection_dir, image), detected_img)
         elif (config.model == "sam3"):
-            detect_animals_sam3(chunk, f)
-        elif (config.model == "sahi"):
-            detect_animals_sahi()
+            detect_animals_sam3(chunk, f, config.prompts)
+        # elif (config.model == "sahi"):
+        #     detect_animals_sahi()
                 
     f.close()
     
