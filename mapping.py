@@ -3,6 +3,9 @@ from utils import timeit, logger
 from qgis.core import QgsApplication, QgsProject, QgsVectorLayer, QgsRasterLayer
 from qgis.core import QgsProcessingProvider, QgsProcessingContext, QgsProcessingFeedback, QgsProcessingAlgorithm,QgsCoordinateReferenceSystem
 from qgis_scripts.cluster import Cluster
+from qgis_scripts.prepare_raw_observations import PrepareRawObs
+from qgis_scripts.cluster_raw_observations import Clusterrawobs
+from qgis_scripts.create_trajectory import CreateTrajectory
 import os
 import sys
 import shutil
@@ -21,6 +24,9 @@ config = None
 class AppProvider(QgsProcessingProvider):
     def loadAlgorithms(self):
         self.addAlgorithm(Cluster())
+        self.addAlgorithm(PrepareRawObs())
+        self.addAlgorithm(Clusterrawobs())
+        self.addAlgorithm(CreateTrajectory())
 
     def id(self, *args, **kwargs):
         """Used for identifying the provider.
@@ -51,12 +57,22 @@ def generate(cfg, execution_times):
 
     provider = AppProvider()
     QgsApplication.processingRegistry().addProvider(provider)
+    print(provider.algorithms())
 
     temp_dir = os.path.join(config.maps_dir, "temp")
     os.makedirs(temp_dir)
     
-    with timeit("mapping.cluster_signs", execution_times):
-        cluster_signs(config.maps_dir)
+    # with timeit("mapping.cluster_signs", execution_times):
+    #     cluster_signs(config.maps_dir)
+
+    with timeit("mapping.create_trajectory", execution_times):
+        create_trajectory(config.maps_dir)
+
+    with timeit("mapping.prepare_row_observations", execution_times):
+        prepare_raw_observations(config.maps_dir)
+
+    with timeit("mapping.cluster_raw_observations", execution_times):
+        cluster_raw_observations(config.maps_dir)
 
     shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -109,4 +125,33 @@ def cluster_signs(input):
 
     processing.run("AppProvider:Cluster", {'crs':config.crs,'distance':0.4,'signs':config.signs_positions_file,'x':'X','y':'Y','z':'Z','OutputSignsLayer':os.path.join(input, "signs.gpkg")}, context=context, feedback=feedback)
     return
-   
+
+def create_trajectory(input):
+    """
+    Create trajectory from metashape project
+    """
+    feedback = QgsProcessingFeedback()
+    context = QgsProcessingContext()
+
+    processing.run("AppProvider:CreateTrajectory", {'crs':config.crs,'x': 'X', 'y': 'Y', 'InputTrajectory':config.trajectory_file_path,'OutputTrajectory':os.path.join(input, "trajectory.gpkg")}, context=context, feedback=feedback)
+    return
+
+def prepare_raw_observations(input):
+    """
+    Prepare raw observations for clustering
+    """
+    feedback = QgsProcessingFeedback()
+    context = QgsProcessingContext()
+
+    processing.run("AppProvider:PrepareRawObs", {'crs':config.crs,'x':'X','y':'Y','z':'Z','animals_detections':config.signs_positions_file,'RawObservations':config.raw_observations_file,'folder_path':config.depth_overlay_dir}, context=context, feedback=feedback)
+    return
+
+def cluster_raw_observations(input):
+    """
+    Clean raw observations by clustering nearby observations of same class
+    """
+    feedback = QgsProcessingFeedback()
+    context = QgsProcessingContext()
+
+    processing.run("AppProvider:ClusterRawObs", {'raw_observations':config.raw_observations_file,'Clusters':os.path.join(input, "clusters.gpkg")}, context=context, feedback=feedback)
+    return

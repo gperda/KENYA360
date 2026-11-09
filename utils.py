@@ -1,8 +1,93 @@
 import logging
 from contextlib import contextmanager
+import os
+import shutil
+import subprocess
 import time
 import numpy as np
 #import pycolmap
+
+logger = logging.getLogger("KENYA360")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s][%(name)s] %(message)s'))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+
+def run_fastfoundation_depth(
+    imgdir,
+    frame_indices,
+    metadata_file,
+    output_dir,
+    cameras,
+    ckpt_dir=None,
+    scale=0.5,
+    valid_iters=32,
+    z_far=200,
+    num_gpus=1,
+    conda_env=None,
+    module_name="scripts.run_demo_batch",
+    extra_args=None,
+):
+    """
+    Run FastFoundation from a dedicated conda environment without installing any
+    extra package into the current project environment.
+
+    This wrapper intentionally does not import FastFoundation in-process.
+    The target environment is expected to already contain the module and its
+    requirements.
+    """
+    if not conda_env:
+        logger.warning("FastFoundation conda environment is not configured; depth step skipped.")
+        return None
+
+    if not os.path.isdir(imgdir):
+        raise FileNotFoundError(f"FastFoundation image directory does not exist: {imgdir}")
+    if not os.path.isfile(metadata_file):
+        raise FileNotFoundError(f"FastFoundation metadata file does not exist: {metadata_file}")
+    if not cameras:
+        raise ValueError("At least one FastFoundation camera must be specified.")
+
+    if isinstance(frame_indices, str):
+        frame_indices_arg = frame_indices
+    else:
+        normalized_indices = sorted({int(idx) for idx in frame_indices})
+        if not normalized_indices:
+            raise ValueError("frame_indices must contain at least one frame index.")
+        frame_indices_arg = ",".join(map(str, normalized_indices))
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
+    if conda_exe is None:
+        raise FileNotFoundError("conda executable not found; cannot invoke FastFoundation in its dedicated environment.")
+
+    cmd = [
+        conda_exe, "run", "-n", conda_env, "/home/ellie/miniforge3/envs/foundation_stereo/bin/python", "/media/ellie/Olympos/FoundationStereo/scripts/run_demo_batch.py",
+        "--imgdir", os.fspath(imgdir),
+        "--frames", frame_indices_arg,
+        "--metadata_file", os.fspath(metadata_file),
+        "--out_dir", os.fspath(output_dir),
+        "--cameras", ",".join(cameras) if not isinstance(cameras, str) else cameras,
+        "--scale", str(scale),
+        "--ckpt_dir", str(ckpt_dir),
+        "--valid_iters", str(valid_iters),
+        "--z_far", str(z_far),
+        "--num_gpus", str(num_gpus),
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    logger.info("Running FastFoundation via conda env '%s': %s", conda_env, " ".join(cmd))
+    completed = subprocess.run(cmd, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"FastFoundation failed with exit code {completed.returncode}. "
+            f"stderr: {completed.stderr.strip() or 'no stderr output'}"
+        )
+
+    return output_dir
 
 @contextmanager
 def timeit(section, execution_times):

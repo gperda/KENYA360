@@ -6,12 +6,13 @@ import mapping
 import animals_detection
 import os
 import shutil
-import Metashape
 import argparse
 import signal
 import subprocess
 import sys
 from config import Config
+from depth import process_detected_frames
+from reconstruction import create_workflow
 from utils import logger, timeit
 
 def main():
@@ -24,12 +25,10 @@ def main():
     else:
         exit(parser.usage)
 
-    if not Metashape.License().valid:
-        exit("Invalid Metashape license. Activate Metashape first.")
-
     logger.info("Starting animals detection and mapping")
 
     execution_times = {}
+    workflow = create_workflow(config)
 
     with timeit("main", execution_times):
         if os.path.exists(config.output_dir):
@@ -60,15 +59,32 @@ def main():
         #     detection.detect()
 
         # Traffic signs detection
-        if os.path.exists(config.signs_detection_dir):
-            shutil.rmtree(config.signs_detection_dir, ignore_errors=True)
-        os.makedirs(config.signs_detection_dir, exist_ok=True)
+        # if os.path.exists(config.signs_detection_dir):
+        #     shutil.rmtree(config.signs_detection_dir, ignore_errors=True)
+        # os.makedirs(config.signs_detection_dir, exist_ok=True)
 
-        with timeit("animals_detection.initialize", execution_times):
-            animals_detection.initialize(config)
+        try:
+            with timeit("animals_detection.initialize", execution_times):
+                animals_detection.initialize(config)
 
-        with timeit("signs_detection.detect", execution_times):
-            animals_detection.detect()
+            with timeit("animals_detection.detect", execution_times):
+                detection_result = animals_detection.detect(workflow)
+
+            with timeit("depth.process_detected_frames", execution_times):
+                process_detected_frames(
+                    detection_result.frames,
+                    detection_result.detected_frame_indices,
+                    config,
+                    detection_result=detection_result,
+                )
+
+            print(detection_result.frames)
+            with timeit("animals_detection.write_positions_csv", execution_times):
+                animals_detection.write_positions_csv(
+                    detection_result,
+                    workflow,
+                    config.signs_positions_file,
+                )
 
         # # Mesh creation
         # if os.path.exists(config.mesh_dir):
@@ -86,13 +102,18 @@ def main():
         # with timeit("orthomosaic.generate", execution_times):
         #     orthomosaic.generate(config, execution_times)
 
-        # Mapping in QGIS
-        if os.path.exists(config.maps_dir):
-            shutil.rmtree(config.maps_dir, ignore_errors=True)
-        os.makedirs(config.maps_dir)
+            if workflow.georeferenced:
+                # Mapping in QGIS is only valid for georeferenced detections.
+                if os.path.exists(config.maps_dir):
+                    shutil.rmtree(config.maps_dir, ignore_errors=True)
+                os.makedirs(config.maps_dir)
 
-        with timeit("mapping.generate", execution_times):
-            mapping.generate(config, execution_times)
+                with timeit("mapping.generate", execution_times):
+                    mapping.generate(config, execution_times)
+            else:
+                logger.info("Skipping mapping: the selected workflow is not georeferenced.")
+        finally:
+            workflow.close()
 
     logger.info("\nExecution time summary:")
     for section, elapsed in execution_times.items():

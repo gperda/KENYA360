@@ -1,12 +1,12 @@
 
 import configparser
 import os
-import Metashape
 
 class Config:
     def __init__(self, config_file):
         opts = configparser.ConfigParser()
         opts.read(config_file)
+        self._config = opts
         self.input_dir = opts.get("General", "input_dir", fallback=None)
         if self.input_dir is None:
             raise ValueError("Missing required config parameter: [General] input_dir")
@@ -21,18 +21,45 @@ class Config:
         self.output_dir = opts.get("General", "output_dir", fallback=None).strip()
         if self.output_dir is None:
             raise ValueError("Missing required config parameter: [General] output_dir")
+
+        self.trajectory_source = opts.get("General", "trajectory_source", fallback="metashape").strip().lower()
+        if self.trajectory_source not in {"metashape", "colmap", "slam"}:
+            raise ValueError(
+                "Unsupported trajectory source specified in config: "
+                f"{self.trajectory_source}. Supported values: metashape, colmap, slam"
+            )
+
+        self.depth_source = opts.get("General", "depth_source", fallback="metashape").strip().lower()
+        if self.depth_source not in {"metashape", "fastfoundation", "colmap", "slam"}:
+            raise ValueError(
+                "Unsupported depth source specified in config: "
+                f"{self.depth_source}. Supported values: metashape, fastfoundation, colmap, slam"
+            )
+
+        self.fastfoundation_conda_env = opts.get("General", "fastfoundation_conda_env", fallback=None)
+        self.fastfoundation_module = opts.get(
+            "General", "fastfoundation_module", fallback="scripts.run_demo_batch"
+        )
+
         prompts = opts.get("Detection", "prompts", fallback=None)
         if prompts is None:
             raise ValueError("Missing required config parameter: [Detection] prompts")
 
         self.prompts = [prompt.strip() for prompt in prompts.split(",") if prompt.strip()]
-        self.signs_detection_dir = os.path.join(self.output_dir, "detection/animals")
-        self.signs_positions_file = os.path.join(self.signs_detection_dir, "animals_positions.csv")
+        detection_dir = os.path.join(self.output_dir, "detection")
+        self.signs_detection_dir = os.path.join(detection_dir, "animals")
+        self.signs_positions_file = os.path.join(detection_dir, "animals_positions.csv")
         self.metashape_dir = os.path.join(self.input_dir, "metashape")
         self.maps_dir = os.path.join(self.output_dir, "maps")
-        self.doc = Metashape.Document()
+        self.raw_observations_file = os.path.join(self.maps_dir, "raw_observations.gpkg")
         self.sam3_half = opts.getboolean("Detection", "sam3_half", fallback=False)
-        
+        self.depth_dir = os.path.join(self.output_dir, "depth")
+        self.depth_overlay_dir = os.path.join(self.depth_dir, "overlay")
+
+
+        if self.trajectory_source == "metashape":
+            self.trajectory_file_path = os.path.join(self.metashape_dir, "trajectory.csv") 
+
         model = opts.get("Detection", "model", fallback=None)
         self.model = model
         if (model == "yolo"):
@@ -48,7 +75,7 @@ class Config:
         else:
             raise ValueError(f"Unsupported detection model specified in config: {model}")
        
-        self.crs = opts.get("Mapping", "crs", fallback="EPSG:4326")
+        self.crs = opts.get("Mapping", "crs", fallback="EPSG:25837")
         # self.block_size = opts.getint("Stereo", "block_size", fallback = 500)
 
 

@@ -1,19 +1,19 @@
 import os
 import cv2
 import glob
-from PIL import Image
-import matplotlib.pyplot as plt
+import csv
 from ultralytics import YOLO
 from ultralytics.utils.plotting import Annotator, colors
 from sam3.model_builder import build_sam3_video_predictor
 from sam3.visualization_utils import (
     load_frame,
-    prepare_masks_for_visualization,
 )
 import numpy as np
 import warnings
 import shutil
-import Metashape
+from dataclasses import dataclass, field
+from utils import logger
+from reconstruction.base import normalize_depth_to_meters, sample_depth_at_bbox_center
 # from sahi import AutoDetectionModel
 # from sahi.predict import get_sliced_prediction
 # from sahi.utils.cv import read_image_as_pil
@@ -22,6 +22,138 @@ WIDTH = 640
 
 model = None
 config = None
+_depth_map_cache = {}
+_depth_lookup_root = None
+
+
+def _depth_root_dir():
+    if config is None:
+        return None
+    if str(getattr(config, "depth_source", "metashape")).lower() != "fastfoundation":
+        return None
+    depth_root = getattr(config, "depth_dir", None)
+    if not depth_root or not os.path.isdir(depth_root):
+        return None
+    return depth_root
+
+
+def _depth_z_far_meters() -> float:
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        value = getter("General", "fastfoundation_z_far", fallback=None)
+        if value is not None and str(value).strip():
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return float(getattr(config, "fastfoundation_z_far", 200.0))
+
+
+def _find_depth_map_path(frame_name: str, depth_root: str) -> str | None:
+    stem, _ = os.path.splitext(os.path.basename(frame_name or ""))
+    if not stem:
+        return None
+
+    patterns = [
+        os.path.join(depth_root, f"{stem}*.jpg"),
+        os.path.join(depth_root, f"{stem}*.npy"),
+        os.path.join(depth_root, f"{stem}*.tif"),
+        os.path.join(depth_root, f"{stem}*.tiff"),
+        os.path.join(depth_root, f"{stem}*.exr"),
+        os.path.join(depth_root, f"*{stem}*.png"),
+        os.path.join(depth_root, f"*{stem}*.npy"),
+    ]
+
+    matches = []
+    for pattern in patterns:
+        matches.extend(glob.glob(pattern))
+    if not matches:
+        return None
+
+    unique = []
+    seen = set()
+    for path in sorted(matches):
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique[0] if unique else None
+
+
+def _load_depth_map(depth_path: str):
+    if depth_path is None or not os.path.exists(depth_path):
+        return None
+
+    _, extension = os.path.splitext(depth_path.lower())
+    if extension == ".npy":
+        depth_array = np.load(depth_path)
+    else:
+        depth_array = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
+        if depth_array is None:
+            depth_array = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    if depth_array is None:
+        return None
+
+    depth_array = np.asarray(depth_array, dtype=np.float32)
+    if depth_array.ndim == 3 and depth_array.shape[-1] in (1, 3, 4):
+        depth_array = depth_array[..., 0]
+    if depth_array.ndim != 2:
+        return None
+    return depth_array
+
+
+def _depth_map_for_frame(frame_name: str):
+    depth_root = _depth_root_dir()
+    if depth_root is None:
+        return None
+
+    global _depth_lookup_root
+    if _depth_lookup_root != depth_root:
+        _depth_map_cache.clear()
+        _depth_lookup_root = depth_root
+
+    stem, _ = os.path.splitext(os.path.basename(frame_name or ""))
+    if not stem:
+        return None
+    if stem in _depth_map_cache:
+        return _depth_map_cache[stem]
+
+    depth_path = _find_depth_map_path(frame_name, depth_root)
+    depth_map = _load_depth_map(depth_path) if depth_path else None
+    _depth_map_cache[stem] = depth_map
+    return depth_map
+
+
+def _depth_m_for_detection(frame_name: str, x_px: float, y_px: float, mask=None) -> float | None:
+    depth_map = _depth_map_for_frame(frame_name)
+    if depth_map is None:
+        return None
+
+    raw_depth = sample_depth_at_bbox_center(depth_map, x_px, y_px, mask)
+    return normalize_depth_to_meters(raw_depth, z_far=_depth_z_far_meters())
+
+
+@dataclass
+class DetectionRecord:
+    frame_index: int
+    frame_name: str
+    frame_path: str | None
+    detection_id: int | str
+    class_name: str
+    x_center: float
+    y_center: float
+    bbox: tuple[float, float, float, float]
+    mask: object | None
+    confidence: float
+    depth_m: float | None = None
+    projection: dict | None = None
+
+
+@dataclass
+class DetectionResult:
+    frames: list
+    detected_frame_indices: set[int]
+    frame_masks: dict[int, list[dict]] = field(default_factory=dict)
+    records: list[DetectionRecord] = field(default_factory=list)
 
 def visualize_frame_output(frame_idx, video_frames, outputs):
     img = load_frame(video_frames[frame_idx])
@@ -237,7 +369,7 @@ def rel_to_abs_coords(coords, IMG_WIDTH, IMG_HEIGHT, coord_type="box"):
 #                 line = f"{camera.label},{x_center:.2f},{y_center:.2f},{X:.6f},{Y:.6f},{Z:.6f},{distance},{class_name},{obj_id},{prob:.4f}\n"
 #                 f.write(line)
 
-def detect_animals_sam3(chunk, f, prompts) -> np.ndarray:
+def detect_animals_sam3(prompts) -> DetectionResult:
     # Load video frames for visualization
     video_path = config.frames_dir
     if isinstance(video_path, str) and video_path.endswith(".mp4"):
@@ -262,12 +394,11 @@ def detect_animals_sam3(chunk, f, prompts) -> np.ndarray:
             )
             video_frames_for_vis.sort()
 
-    crs = chunk.crs
-    T = chunk.transform.matrix
-    cameras = chunk.cameras
-
     frame_output_names = {}
     combined_output_frames = {}
+    detected_frame_indices = set()
+    frame_masks = {}
+    records = []
 
     for frame_idx, frame_ref in enumerate(video_frames_for_vis):
         if isinstance(frame_ref, str):
@@ -277,7 +408,6 @@ def detect_animals_sam3(chunk, f, prompts) -> np.ndarray:
 
     # Split frames into blocks — done once, outside all loops
     BLOCK_SIZE = 100
-    start_offset = 0
     total_frames = len(video_frames_for_vis)
     frame_blocks = [
         video_frames_for_vis[i:i + BLOCK_SIZE]
@@ -335,6 +465,9 @@ def detect_animals_sam3(chunk, f, prompts) -> np.ndarray:
                 global_frame_idx = block_start + local_frame_idx
 
                 if frame_outputs["out_obj_ids"].shape[0] > 0:
+                    detected_frame_indices.add(global_frame_idx)
+                    print("added frame index", global_frame_idx, frame_output_names[global_frame_idx])
+
                     detected_img = visualize_frame_output(
                         global_frame_idx,
                         video_frames_for_vis,
@@ -352,34 +485,49 @@ def detect_animals_sam3(chunk, f, prompts) -> np.ndarray:
                     
                     
 
-                if global_frame_idx > len(cameras) - 1:
-                    continue
-                camera = cameras[global_frame_idx + start_offset]
-                if camera.transform is None:
-                    continue
+                    for j in range(len(frame_outputs["out_obj_ids"])):
+                        hi, wi = frame_outputs["out_binary_masks"].shape[1:3]
+                        box_xywh = frame_outputs["out_boxes_xywh"][j]
+                        prob = frame_outputs["out_probs"][j]
+                        obj_id = frame_outputs["out_obj_ids"][j]
+                        x, y, w, h = rel_to_abs_coords([box_xywh], wi, hi, coord_type="box")[0]
+                        x_center = x + w / 2
+                        y_center = y + h / 2
+                        class_name = prompt
+                        mask = frame_outputs["out_binary_masks"][j].astype(bool)
+                        frame_masks.setdefault(global_frame_idx, []).append(
+                            {
+                                "frame_index": global_frame_idx,
+                                "frame_name": frame_output_names[global_frame_idx],
+                                "detection_id": int(obj_id) if isinstance(obj_id, (int, np.integer)) else str(obj_id),
+                                "class_name": class_name,
+                                "x_center": float(x_center),
+                                "y_center": float(y_center),
+                                "bbox": (float(x), float(y), float(w), float(h)),
+                                "mask": mask,
+                                "confidence": float(prob),
+                            }
+                        )
 
-                for j in range(len(frame_outputs["out_obj_ids"])):
-                    hi, wi = frame_outputs["out_binary_masks"].shape[1:3]
-                    box_xywh = frame_outputs["out_boxes_xywh"][j]
-                    prob = frame_outputs["out_probs"][j]
-                    obj_id = frame_outputs["out_obj_ids"][j]
-                    x, y, w, h = rel_to_abs_coords([box_xywh], wi, hi, coord_type="box")[0]
-                    x_center = x + w / 2
-                    y_center = y + h / 2
-                    class_name = prompt
-
-                    pt_3D = chunk.tie_points.pickPoint(
-                        camera.center,
-                        camera.transform.mulp(
-                            camera.sensor.calibration.unproject(Metashape.Vector([x_center, y_center]))
-                        ),
-                    )
-                    pt_3D_world = crs.project(T.mulp(pt_3D))
-                    proj_xy = crs.project(T.mulp(camera.center))
-                    distance = np.linalg.norm(pt_3D_world[:2] - proj_xy[:2])
-                    X, Y, Z = pt_3D_world
-                    line = f"{camera.label},{x_center:.2f},{y_center:.2f},{X:.6f},{Y:.6f},{Z:.6f},{distance},{class_name},{obj_id},{prob:.4f}\n"
-                    f.write(line)
+                        frame_ref = video_frames_for_vis[global_frame_idx]
+                        frame_path = frame_ref if isinstance(frame_ref, str) else None
+                        depth_frame_name = frame_path or frame_output_names[global_frame_idx]
+                        detection_id = int(obj_id) if isinstance(obj_id, (int, np.integer)) else str(obj_id)
+                        records.append(
+                            DetectionRecord(
+                                frame_index=global_frame_idx,
+                                frame_name=frame_output_names[global_frame_idx],
+                                frame_path=frame_path,
+                                detection_id=detection_id,
+                                class_name=class_name,
+                                x_center=float(x_center),
+                                y_center=float(y_center),
+                                bbox=(float(x), float(y), float(w), float(h)),
+                                mask=mask,
+                                confidence=float(prob),
+                                depth_m=_depth_m_for_detection(depth_frame_name, x_center, y_center, mask),
+                            )
+                        )
             shutil.rmtree(block_dir, ignore_errors=True)
             # Close session at the end of each block, still within the prompt loop
             video_predictor.handle_request(
@@ -396,7 +544,9 @@ def detect_animals_sam3(chunk, f, prompts) -> np.ndarray:
             cv2.cvtColor(combined_img, cv2.COLOR_RGB2BGR),
         )
 
-def detect_animals_yolo(img, chunk, camera, f) -> np.ndarray:
+    return DetectionResult(video_frames_for_vis, detected_frame_indices, frame_masks, records)
+
+def detect_animals_yolo(img, frame_index, frame_path) -> tuple[np.ndarray, bool, list[dict], list[DetectionRecord]]:
     """
     Detects and annotates traffic signs in an image using YOLO model.
     Args:
@@ -414,32 +564,18 @@ def detect_animals_yolo(img, chunk, camera, f) -> np.ndarray:
     result = results[0]
     boxes = result.boxes
     annotator = Annotator(img.copy())
-    
+    per_frame_detections = []
+    records = []
+
     x_scale = original_width / WIDTH
     y_scale = original_height / HEIGHT
-
-    crs = chunk.crs
-    T = chunk.transform.matrix
 
     for box in boxes:
         coordinates = box.xyxy[0].cpu().numpy()
         x_center = float(box.xywh[0][0].item()) * x_scale
         y_center = float(box.xywh[0][1].item()) * y_scale
 
-        if (camera.transform == None): #Sanity check, camera not aligned
-            continue
-        
-        pt_3D = chunk.tie_points.pickPoint(camera.center, camera.transform.mulp(camera.sensor.calibration.unproject(Metashape.Vector([x_center, y_center]))))
-        pt_3D_world  = crs.project(T.mulp(pt_3D))  # transform to CRS
-
-        proj_xy = crs.project(T.mulp(camera.center))
-
-        distance = np.linalg.norm(pt_3D_world[:2] - proj_xy[:2])
-        if distance > 25:
-            continue
-
         class_id = int(box.cls)
-        #class_name = "-".join(model.names[class_id].split("--")[:-1])
         class_name = model.names[class_id]
 
         x1, y1, x2, y2 = coordinates
@@ -448,45 +584,155 @@ def detect_animals_yolo(img, chunk, camera, f) -> np.ndarray:
         y1 *= y_scale
         y2 *= y_scale
 
-        annotator.box_label((x1, y1, x2, y2), class_name)
         conf = float(box.conf[0].item()) if hasattr(box, "conf") else 0.0
-        X, Y, Z = pt_3D_world
+        annotator.box_label((x1, y1, x2, y2), class_name)
 
-        line = f"{camera.label}, {x_center:.2f},{y_center:.2f},{X:.6f},{Y:.6f},{Z:.6f},{distance},{class_name},{conf:.4f}\n"
-        f.write(line)
+        mask = np.zeros(img.shape[:2], dtype=bool)
+        mask[int(max(0, y1)):int(min(img.shape[0], y2)), int(max(0, x1)):int(min(img.shape[1], x2))] = True
+        per_frame_detections.append(
+            {
+                "frame_index": frame_index,
+                "frame_name": os.path.basename(frame_path),
+                "detection_id": class_id,
+                "class_name": class_name,
+                "x_center": float(x_center),
+                "y_center": float(y_center),
+                "bbox": (float(x1), float(y1), float(x2 - x1), float(y2 - y1)),
+                "mask": mask,
+                "confidence": conf,
+            }
+        )
+        records.append(
+            DetectionRecord(
+                frame_index=frame_index,
+                frame_name=os.path.basename(frame_path),
+                frame_path=frame_path,
+                detection_id=class_id,
+                class_name=class_name,
+                x_center=float(x_center),
+                y_center=float(y_center),
+                bbox=(float(x1), float(y1), float(x2 - x1), float(y2 - y1)),
+                mask=mask,
+                confidence=conf,
+                depth_m=_depth_m_for_detection(frame_path, x_center, y_center, mask),
+            )
+        )
 
     detected_img = annotator.result()
 
-    return detected_img
+    return detected_img, len(boxes) > 0, per_frame_detections, records
 
-def detect() -> None:
+
+def _sync_record_depth_from_frame_masks(detection_result: DetectionResult, record: DetectionRecord) -> None:
+    frame_detections = detection_result.frame_masks.get(record.frame_index, [])
+    target_id = str(record.detection_id)
+    match = None
+
+    for detection in frame_detections:
+        if str(detection.get("detection_id", "")) != target_id:
+            continue
+        match = detection
+        break
+
+    if match is None:
+        return
+
+    distance_m = match.get("distance_m")
+    if distance_m is None:
+        return
+
+    try:
+        record.depth_m = float(distance_m)
+    except (TypeError, ValueError):
+        return
+
+
+def write_positions_csv(detection_result: DetectionResult, workflow, csv_path: str) -> None:
+    with open(csv_path, "w", newline="") as output:
+        writer = csv.writer(output)
+        writer.writerow(["Image", "x_px", "y_px", "X", "Y", "Z", "distance_from_camera", "type", "id", "confidence"])
+
+        for record in detection_result.records:
+            if record.depth_m is None:
+                _sync_record_depth_from_frame_masks(detection_result, record)
+
+            projection = workflow.project_detection(
+                frame_index=record.frame_index,
+                frame_path=record.frame_path,
+                x_px=record.x_center,
+                y_px=record.y_center,
+                depth_m=record.depth_m,
+                class_name=record.class_name,
+                detection_id=record.detection_id,
+                confidence=record.confidence,
+            )
+
+            if projection is None:
+                continue
+
+            record.projection = projection
+            writer.writerow(
+                [
+                    projection.get("Image", record.frame_name),
+                    f"{float(projection.get('x_px', record.x_center)):.2f}",
+                    f"{float(projection.get('y_px', record.y_center)):.2f}",
+                    f"{float(projection.get('X')):.6f}",
+                    f"{float(projection.get('Y')):.6f}",
+                    f"{float(projection.get('Z')):.6f}",
+                    str(record.depth_m),
+                    record.class_name,
+                    record.detection_id,
+                    f"{record.confidence:.4f}",
+                ]
+            )
+            print(projection.get("Image", record.frame_name),
+                                f"{float(projection.get('x_px', record.x_center)):.2f}",
+                                f"{float(projection.get('y_px', record.y_center)):.2f}",
+                                f"{float(projection.get('X')):.6f}",
+                                f"{float(projection.get('Y')):.6f}",
+                                f"{float(projection.get('Z')):.6f}",
+                                str(record.depth_m),
+                                record.class_name,
+                                record.detection_id,
+                                f"{record.confidence:.4f}",)
+
+def detect(workflow) -> DetectionResult:
     """
     Runs sign detection on all images in the configured images directory.
     """
     global config
-    doc = config.doc
-    doc.open(os.path.join(config.metashape_dir, "metashape.psx"))
-    chunk = doc.chunks[0]
+    detected_frame_indices = set()
+    frame_masks = {}
+    records = []
+    if isinstance(config.frames_dir, str) and config.frames_dir.endswith(".mp4"):
+        frame_paths = [config.frames_dir]
+    else:
+        frame_paths = glob.glob(os.path.join(config.frames_dir, "*.jpg"))
+        try:
+            frame_paths.sort(key=lambda path: int(os.path.splitext(os.path.basename(path))[0]))
+        except ValueError:
+            frame_paths.sort()
 
-    with open(config.signs_positions_file, "a") as f:
-        f.write("Image, x_px, y_px, X, Y, Z, distance_from_camera, type, id, confidence\n")
-        if (config.model == "yolo"):
-            for image in os.listdir(config.frames_dir):
-                if not image.endswith(".jpg"):
-                    continue
-                path = os.path.join(config.frames_dir, image)
-                img = cv2.imread(path, cv2.IMREAD_COLOR).copy()
-
-                camera = next((c for c in chunk.cameras if c.label == image.replace(".jpg", "")), None)
-                
-                detected_img= detect_animals_yolo(img, chunk, camera, f)
-                cv2.imwrite(os.path.join(config.signs_detection_dir, image), detected_img)
-        elif (config.model == "sam3"):
-            detect_animals_sam3(chunk, f, config.prompts)
+    if (config.model == "yolo"):
+        for frame_index, path in enumerate(frame_paths):
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            if img is None:
+                logger.warning("Unable to read image frame %s; skipping detection.", path)
+                continue
+            detected_img, has_detections, detections, frame_records = detect_animals_yolo(
+                img, frame_index, path
+            )
+            if has_detections:
+                detected_frame_indices.add(frame_index)
+                frame_masks[frame_index] = detections
+                records.extend(frame_records)
+            cv2.imwrite(os.path.join(config.signs_detection_dir, os.path.basename(path)), detected_img)
+    elif (config.model == "sam3"):
+        return detect_animals_sam3(config.prompts)
         # elif (config.model == "sahi"):
         #     detect_animals_sahi()
-                
-    f.close()
+
+    return DetectionResult(frame_paths, detected_frame_indices, frame_masks, records)
     
 def initialize(cfg) -> None:
     """
