@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 from reconstruction.base import normalize_depth_to_meters, sample_depth_at_bbox_center
-from utils import logger, run_fastfoundation_depth
+from utils import logger, run_fs_depth
 
 
 def _find_depth_paths(frame_name, depth_root):
@@ -55,24 +55,24 @@ def _load_depth_map(depth_path):
 
 
 def process_detected_frames(frames, frame_indices, config, detection_result=None):
-    """Run FastFoundation depth extraction and compute a metric depth distance for each detection."""
+    """Run FoundationStereo depth extraction and compute a metric depth distance for each detection."""
     depth_source = getattr(config, "depth_source", "metashape")
     if depth_source == "metashape":
         return {}
-    if depth_source != "fastfoundation":
+    if depth_source != "foundation_stereo":
         logger.warning("Depth source '%s' is not implemented; skipping depth processing.", depth_source)
         return {}
 
-    conda_env = getattr(config, "fastfoundation_conda_env", None)
+    conda_env = getattr(config, "fs_conda_env", None)
     if not conda_env:
-        logger.warning("FastFoundation depth source is selected but no conda env is configured.")
+        logger.warning("FoundationStereo depth source is selected but no conda env is configured.")
         return {}
 
-    module_name = getattr(config, "fastfoundation_module", "scripts.run_demo_batch")
+    module_name = getattr(config, "fs_module", "scripts.run_demo_batch")
     output_root = getattr(config, "depth_dir")
     os.makedirs(output_root, exist_ok=True)
     if not frame_indices:
-        logger.info("No detected frames; skipping FastFoundation batch depth processing.")
+        logger.info("No detected frames; skipping FoundationStereo batch depth processing.")
         return {}
 
     def setting(name, default):
@@ -89,31 +89,31 @@ def process_detected_frames(frames, frame_indices, config, detection_result=None
     input_root = getattr(config, "input_dir", config.frames_dir)
     imgdir = input_root
     metadata_file = setting(
-        "fastfoundation_metadata_file",
+        "fs_metadata_file",
         os.path.join(input_root, "metadata.json"),
     )
     camera_default = getattr(config, "camera", os.path.basename(config.frames_dir.rstrip(os.sep)))
-    cameras = setting("fastfoundation_cameras", camera_default)
+    cameras = setting("fs_cameras", camera_default)
     if isinstance(cameras, str):
         cameras = [camera.strip() for camera in cameras.split(",") if camera.strip()]
 
     try:
-        run_fastfoundation_depth(
+        run_fs_depth(
             imgdir=imgdir,
             frame_indices=frame_indices,
             metadata_file=metadata_file,
             output_dir=output_root,
             cameras=cameras,
-            ckpt_dir=setting("fastfoundation_ckpt_dir", None),
-            scale=float(setting("fastfoundation_scale", 0.5)),
-            valid_iters=int(setting("fastfoundation_valid_iters", 32)),
-            z_far=float(setting("fastfoundation_z_far", 200)),
-            num_gpus=int(setting("fastfoundation_num_gpus", 1)),
+            ckpt_dir=setting("fs_ckpt_dir", None),
+            scale=float(setting("fs_scale", 0.5)),
+            valid_iters=int(setting("fs_valid_iters", 32)),
+            z_far=float(setting("fs_z_far", 200)),
+            num_gpus=int(setting("fs_num_gpus", 1)),
             conda_env=conda_env,
             module_name=module_name,
         )
     except Exception as exc:
-        logger.warning("FastFoundation batch depth invocation failed: %s", exc)
+        logger.warning("FoundationStereo batch depth invocation failed: %s", exc)
         return {}
 
     if detection_result is None or not getattr(detection_result, "frame_masks", None):
@@ -122,7 +122,7 @@ def process_detected_frames(frames, frame_indices, config, detection_result=None
 
     debug_dir = getattr(config, "depth_overlay_dir")
     os.makedirs(debug_dir, exist_ok=True)
-    z_far = float(getattr(config, "fastfoundation_z_far", 200.0))
+    z_far = float(getattr(config, "fs_z_far", 200.0))
     frame_index_to_name = {}
     for idx, frame in enumerate(frames):
         if isinstance(frame, str):

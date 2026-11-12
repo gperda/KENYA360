@@ -22,6 +22,12 @@ class Config:
         if self.output_dir is None:
             raise ValueError("Missing required config parameter: [General] output_dir")
 
+        self.camera_calibration = opts.get("General", "camera_calibration", fallback = None)
+        if self.camera_calibration is None:
+            raise ValueError(f"Input calibration does not exist: {self.camera_calibration}")
+
+        self.camera_reference_path = os.path.join(self.input_dir, "camera_reference.csv")
+
         self.trajectory_source = opts.get("General", "trajectory_source", fallback="metashape").strip().lower()
         if self.trajectory_source not in {"metashape", "colmap", "slam"}:
             raise ValueError(
@@ -30,15 +36,15 @@ class Config:
             )
 
         self.depth_source = opts.get("General", "depth_source", fallback="metashape").strip().lower()
-        if self.depth_source not in {"metashape", "fastfoundation", "colmap", "slam"}:
+        if self.depth_source not in {"metashape", "foundation_stereo", "colmap", "slam"}:
             raise ValueError(
                 "Unsupported depth source specified in config: "
-                f"{self.depth_source}. Supported values: metashape, fastfoundation, colmap, slam"
+                f"{self.depth_source}. Supported values: metashape, foundation_stereo, colmap, slam"
             )
 
-        self.fastfoundation_conda_env = opts.get("General", "fastfoundation_conda_env", fallback=None)
-        self.fastfoundation_module = opts.get(
-            "General", "fastfoundation_module", fallback="scripts.run_demo_batch"
+        self.fs_conda_env = opts.get("General", "fs_conda_env", fallback=None)
+        self.fs_module = opts.get(
+            "General", "fs_module", fallback="scripts.run_demo_batch"
         )
 
         prompts = opts.get("Detection", "prompts", fallback=None)
@@ -58,7 +64,16 @@ class Config:
 
 
         if self.trajectory_source == "metashape":
-            self.trajectory_file_path = os.path.join(self.metashape_dir, "trajectory.csv") 
+            self.trajectory_file_path = os.path.join(self.metashape_dir, "trajectory.csv")
+        elif self.trajectory_source == "colmap":
+            self.colmap_dir = os.path.join(self.input_dir, "colmap")
+            self.trajectory_file_path = os.path.join(self.colmap_dir, "trajectory_optimized.csv")
+
+
+        self.reconstruction_config_path = opts.get("Reconstruction", "reconstruction_config_path", fallback = None)
+        self.gnss_sigma = opts.get("Reconstruction", "gnss_sigma", fallback=0.05)
+        self.odo_sigma_rot = opts.get("Reconstruction", "odo_sigma_rot", fallback = 0.01)
+        self.odo_sigma_trans = opts.get("Reconstruction", "odo_sigma_trans", fallback=0.05)
 
         model = opts.get("Detection", "model", fallback=None)
         self.model = model

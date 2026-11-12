@@ -29,7 +29,7 @@ _depth_lookup_root = None
 def _depth_root_dir():
     if config is None:
         return None
-    if str(getattr(config, "depth_source", "metashape")).lower() != "fastfoundation":
+    if str(getattr(config, "depth_source", "metashape")).lower() != "foundation_stereo":
         return None
     depth_root = getattr(config, "depth_dir", None)
     if not depth_root or not os.path.isdir(depth_root):
@@ -40,13 +40,13 @@ def _depth_root_dir():
 def _depth_z_far_meters() -> float:
     getter = getattr(config, "get", None)
     if callable(getter):
-        value = getter("General", "fastfoundation_z_far", fallback=None)
+        value = getter("General", "fs_z_far", fallback=None)
         if value is not None and str(value).strip():
             try:
                 return float(value)
             except (TypeError, ValueError):
                 pass
-    return float(getattr(config, "fastfoundation_z_far", 200.0))
+    return float(getattr(config, "fs_z_far", 200.0))
 
 
 def _find_depth_map_path(frame_name: str, depth_root: str) -> str | None:
@@ -466,7 +466,6 @@ def detect_animals_sam3(prompts) -> DetectionResult:
 
                 if frame_outputs["out_obj_ids"].shape[0] > 0:
                     detected_frame_indices.add(global_frame_idx)
-                    print("added frame index", global_frame_idx, frame_output_names[global_frame_idx])
 
                     detected_img = visualize_frame_output(
                         global_frame_idx,
@@ -685,16 +684,7 @@ def write_positions_csv(detection_result: DetectionResult, workflow, csv_path: s
                     f"{record.confidence:.4f}",
                 ]
             )
-            print(projection.get("Image", record.frame_name),
-                                f"{float(projection.get('x_px', record.x_center)):.2f}",
-                                f"{float(projection.get('y_px', record.y_center)):.2f}",
-                                f"{float(projection.get('X')):.6f}",
-                                f"{float(projection.get('Y')):.6f}",
-                                f"{float(projection.get('Z')):.6f}",
-                                str(record.depth_m),
-                                record.class_name,
-                                record.detection_id,
-                                f"{record.confidence:.4f}",)
+            
 
 def detect(workflow) -> DetectionResult:
     """

@@ -1,6 +1,8 @@
+import csv
 import logging
 from contextlib import contextmanager
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -15,7 +17,7 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 
-def run_fastfoundation_depth(
+def run_fs_depth(
     imgdir,
     frame_indices,
     metadata_file,
@@ -31,23 +33,23 @@ def run_fastfoundation_depth(
     extra_args=None,
 ):
     """
-    Run FastFoundation from a dedicated conda environment without installing any
+    Run FoundationStereo from a dedicated conda environment without installing any
     extra package into the current project environment.
 
-    This wrapper intentionally does not import FastFoundation in-process.
+    This wrapper intentionally does not import FoundationStereo in-process.
     The target environment is expected to already contain the module and its
     requirements.
     """
     if not conda_env:
-        logger.warning("FastFoundation conda environment is not configured; depth step skipped.")
+        logger.warning("FoundationStereo conda environment is not configured; depth step skipped.")
         return None
 
     if not os.path.isdir(imgdir):
-        raise FileNotFoundError(f"FastFoundation image directory does not exist: {imgdir}")
+        raise FileNotFoundError(f"FoundationStereo image directory does not exist: {imgdir}")
     if not os.path.isfile(metadata_file):
-        raise FileNotFoundError(f"FastFoundation metadata file does not exist: {metadata_file}")
+        raise FileNotFoundError(f"FoundationStereo metadata file does not exist: {metadata_file}")
     if not cameras:
-        raise ValueError("At least one FastFoundation camera must be specified.")
+        raise ValueError("At least one FoundationStereo camera must be specified.")
 
     if isinstance(frame_indices, str):
         frame_indices_arg = frame_indices
@@ -61,7 +63,7 @@ def run_fastfoundation_depth(
 
     conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
     if conda_exe is None:
-        raise FileNotFoundError("conda executable not found; cannot invoke FastFoundation in its dedicated environment.")
+        raise FileNotFoundError("conda executable not found; cannot invoke FoundationStereo in its dedicated environment.")
 
     cmd = [
         conda_exe, "run", "-n", conda_env, "/home/ellie/miniforge3/envs/foundation_stereo/bin/python", "/media/ellie/Olympos/FoundationStereo/scripts/run_demo_batch.py",
@@ -79,11 +81,11 @@ def run_fastfoundation_depth(
     if extra_args:
         cmd.extend(extra_args)
 
-    logger.info("Running FastFoundation via conda env '%s': %s", conda_env, " ".join(cmd))
+    logger.info("Running FoundationStereo via conda env '%s': %s", conda_env, " ".join(cmd))
     completed = subprocess.run(cmd, capture_output=True, text=True)
     if completed.returncode != 0:
         raise RuntimeError(
-            f"FastFoundation failed with exit code {completed.returncode}. "
+            f"FoundationStereo failed with exit code {completed.returncode}. "
             f"stderr: {completed.stderr.strip() or 'no stderr output'}"
         )
 
@@ -147,12 +149,69 @@ def setup_logger(name="ViatekApp", level=logging.DEBUG):
 
 def quaternion_to_rotation_matrix(qvec):
     """Convert quaternion to rotation matrix."""
-    w, x, y, z = qvec
+    qvec = np.asarray(qvec, dtype=np.float64)
+    if qvec.shape != (4,):
+        raise ValueError(f"Quaternion must contain 4 values, got shape {qvec.shape}")
+
+    norm = np.linalg.norm(qvec)
+    if norm == 0.0:
+        raise ValueError("Quaternion has zero norm")
+
+    w, x, y, z = qvec / norm
     return np.array([
         [1 - 2*y*y - 2*z*z,     2*x*y - 2*z*w,     2*x*z + 2*y*w],
         [    2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z,     2*y*z - 2*x*w],
         [    2*x*z - 2*y*w,     2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
-    ])
+    ], dtype=np.float64)
+
+
+def quaternion_to_euler_omega_phi_kappa(qvec):
+    """Convert quaternion (w, x, y, z) to Euler angles (Omega, Phi, Kappa) in radians."""
+    rotation_matrix = quaternion_to_rotation_matrix(qvec)
+
+    omega = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
+    phi = np.arctan2(
+        -rotation_matrix[2, 0],
+        np.hypot(rotation_matrix[2, 1], rotation_matrix[2, 2]),
+    )
+    kappa = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+    return np.asarray([omega, phi, kappa], dtype=np.float64)
+
+
+def refactor_trajectory_file(input_path: str, output_path: str) -> str:
+    """
+    Read a trajectory text file with rows like:
+      # image_name tx ty tz qw qx qy qz
+      image_000.jpg 12.3 45.6 78.9 0.7071 0.0 0.0 0.7071
+
+    and export a CSV with the columns:
+      frame,X,Y,Z,Omega,Phi,Kappa
+
+    Angles are computed from the original quaternion rotation.
+    """
+    rows = []
+    with open(input_path, "r", encoding="utf-8") as src:
+        for raw_line in src:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            tokens = [token for token in re.split(r"[\s,]+", line) if token]
+            if len(tokens) < 8:
+                continue
+
+            frame = os.path.splitext(os.path.basename(tokens[0]))[0]
+            x, y, z = map(float, tokens[1:4])
+            qw, qx, qy, qz = map(float, tokens[4:8])
+            omega, phi, kappa = quaternion_to_euler_omega_phi_kappa((qw, qx, qy, qz))
+            rows.append([frame, x, y, z, float(omega), float(phi), float(kappa)])
+    with open(output_path, "w", newline="", encoding="utf-8") as dst:
+        writer = csv.writer(dst)
+        writer.writerow(["frame", "X", "Y", "Z", "Omega", "Phi", "Kappa"])
+        writer.writerows(rows)
+
+    return input_path
+
 
 def get_focal_and_distortion(cam):
     """Extract focal length and up to two distortion coefficients."""

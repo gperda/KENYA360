@@ -57,7 +57,6 @@ def generate(cfg, execution_times):
 
     provider = AppProvider()
     QgsApplication.processingRegistry().addProvider(provider)
-    print(provider.algorithms())
 
     temp_dir = os.path.join(config.maps_dir, "temp")
     os.makedirs(temp_dir)
@@ -132,7 +131,7 @@ def create_trajectory(input):
     """
     feedback = QgsProcessingFeedback()
     context = QgsProcessingContext()
-
+    print("MApping with " , config.trajectory_file_path)
     processing.run("AppProvider:CreateTrajectory", {'crs':config.crs,'x': 'X', 'y': 'Y', 'InputTrajectory':config.trajectory_file_path,'OutputTrajectory':os.path.join(input, "trajectory.gpkg")}, context=context, feedback=feedback)
     return
 

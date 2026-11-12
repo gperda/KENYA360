@@ -38,6 +38,9 @@ class MetashapeWorkflow(ReconstructionWorkflow):
         # a different camera when filenames and camera labels diverge.
         return None
 
+    def reconstruct(self, config):
+        return
+    
     def project_detection(
         self,
         frame_index: int,
